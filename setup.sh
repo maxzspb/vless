@@ -103,7 +103,7 @@ fi
 step "Cloudflare WARP"
 if ip link show warp &>/dev/null && [ -f /etc/wireguard/warp.conf ]; then
     info "WARP уже настроен — пропускаем"
-    WARP_IP=$(curl -s --interface warp --max-time 10 https://ifconfig.me 2>/dev/null)
+    WARP_IP=$(curl -s --interface warp --max-time 10 https://ifconfig.me 2>/dev/null || true)
 else
     info "Устанавливаем warp-cli..."
     curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | \
@@ -159,7 +159,7 @@ EOF
 
     wg-quick up warp 2>/dev/null || true
     systemctl enable wg-quick@warp
-    WARP_IP=$(curl -s --interface warp --max-time 10 https://ifconfig.me 2>/dev/null)
+    WARP_IP=$(curl -s --interface warp --max-time 10 https://ifconfig.me 2>/dev/null || true)
 fi
 [ -n "$WARP_IP" ] \
     && info "WARP работает. Выходной IP: $WARP_IP (Cloudflare)" \
@@ -297,11 +297,11 @@ if $INSTALL_VLESS; then
             "$XRAY_TPL" > $WORKDIR/xray_config.json
 
         docker cp $WORKDIR/xray_config.json 3x-ui:/app/bin/config.json
-        docker restart 3x-ui
+        docker restart 3x-ui 2>/dev/null || true
         sleep 4
         info "Xray конфиг применён"
 
-        VPS_IP=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null)
+        VPS_IP=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null || true)
         VLESS_URI="vless://${UUID}@${VPS_IP}:443?type=xhttp&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=www.microsoft.com&sid=${SHORT_ID}&spx=%2F&path=%2F&mode=auto#VLESS-$(hostname)"
         echo "$VLESS_URI" > $WORKDIR/vless-uri.txt
         info "VLESS URI сохранён: $WORKDIR/vless-uri.txt"
@@ -354,7 +354,7 @@ fi
 info "Cron настроен (GeoIP каждое воскресенье в 3:00)"
 
 # ── Итог ─────────────────────────────────────────────────────
-MY_IP=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null)
+MY_IP=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null || true)
 SSH_PORT=$(ss -tlnp 2>/dev/null | grep sshd | awk '{print $4}' | cut -d: -f2 | head -1 || echo "22")
 
 echo ""
