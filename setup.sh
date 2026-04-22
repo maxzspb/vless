@@ -242,7 +242,7 @@ info "docker-compose.yaml создан"
 # ── Запуск контейнеров ───────────────────────────────────────
 step "Docker"
 cd $WORKDIR
-docker compose up -d --no-recreate
+docker-compose up -d --no-recreate
 sleep 8
 
 FAILED=false
