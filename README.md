@@ -89,7 +89,7 @@ apt update && apt install -y curl wget git wireguard \
 
 # 3. Создать рабочую папку и скачать скрипт
 mkdir -p ~/vless && cd ~/vless
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/setup.sh \
+curl -fsSL https://raw.githubusercontent.com/maxzspb/vless/main/setup.sh \
     -o setup.sh && chmod +x setup.sh
 
 # 4. Запустить
