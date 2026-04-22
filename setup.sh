@@ -32,9 +32,10 @@ if docker compose version &> /dev/null; then
 elif command -v docker-compose &> /dev/null; then
     DOCKER_COMPOSE="docker-compose"
 else
-    info "Устанавливаем Docker Compose Plugin..."
-    apt-get install -y docker-compose-plugin -qq
-    DOCKER_COMPOSE="docker compose"
+    info "Скачиваем Docker Compose с GitHub..."
+    curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$(uname -m)" -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+    DOCKER_COMPOSE="docker-compose"
 fi
 info "Используем команду: $DOCKER_COMPOSE"
 
@@ -163,8 +164,6 @@ https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | \
         WARP_ADDR_USE="172.16.0.2/32"
     fi
 
-    # Table=off + policy routing через PostUp/PostDown
-    # sendThrough: 172.16.0.2 в Xray будет работать благодаря таблице 2408
     cat > /etc/wireguard/warp.conf << EOF
 [Interface]
 PrivateKey = $WARP_KEY_USE
@@ -279,23 +278,19 @@ info "Контейнеры запущены"
 if $INSTALL_VLESS; then
     step "Xray конфиг"
 
-    # Ждём пока 3x-ui инициализирует БД
     for i in $(seq 1 20); do
         [ -f $WORKDIR/db/x-ui.db ] && break
         sleep 2
     done
 
-    # Генерируем UUID и Reality keypair
     UUID=$(cat /proc/sys/kernel/random/uuid)
     SHORT_ID=$(openssl rand -hex 4)
 
-    # Пробуем получить keypair через xray внутри контейнера
     KEYPAIR=$(docker exec 3x-ui xray x25519 2>/dev/null || \
               docker exec 3x-ui /usr/local/x-ui/bin/xray x25519 2>/dev/null || echo "")
     PRIVATE_KEY=$(echo "$KEYPAIR" | grep -i "private" | awk '{print $NF}')
     PUBLIC_KEY=$(echo "$KEYPAIR"  | grep -i "public"  | awk '{print $NF}')
 
-    # Fallback — генерируем через openssl
     if [ -z "$PRIVATE_KEY" ]; then
         PRIVATE_KEY=$(openssl genpkey -algorithm X25519 2>/dev/null | \
             openssl pkey -outform DER 2>/dev/null | tail -c 32 | \
@@ -307,7 +302,6 @@ if $INSTALL_VLESS; then
     info "UUID: $UUID"
     info "Reality PrivateKey готов"
 
-    # Скачиваем шаблон
     XRAY_TPL=$WORKDIR/xray_config_template.json
     [ ! -f "$XRAY_TPL" ] && \
         curl -fsSL "$REPO_RAW/xray_config_template.json" -o "$XRAY_TPL" 2>/dev/null || true
@@ -330,7 +324,7 @@ if $INSTALL_VLESS; then
         echo "$VLESS_URI" > $WORKDIR/vless-uri.txt
         info "VLESS URI сохранён: $WORKDIR/vless-uri.txt"
     else
-        warning "Шаблон не найден — настрой VLESS в панели вручную (Шаг 4 в README)"
+        warning "Шаблон не найден — настрой VLESS в панели вручную"
     fi
 fi
 
@@ -345,7 +339,6 @@ fi
 # ── iptables: UDP port hopping для Hysteria2 ─────────────────
 if $INSTALL_HY; then
     step "iptables / port hopping"
-    # Идемпотентно: удаляем старые перед добавлением
     iptables -t nat -D PREROUTING -p udp --dport 443         -j REDIRECT --to-port 8443 2>/dev/null || true
     iptables -t nat -D PREROUTING -p udp --dport 20000:31462 -j REDIRECT --to-port 8443 2>/dev/null || true
     iptables -t nat -D PREROUTING -p udp --dport 31464:50000 -j REDIRECT --to-port 8443 2>/dev/null || true
