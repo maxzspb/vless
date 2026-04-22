@@ -1,0 +1,163 @@
+{
+  "log": {
+    "access": "none",
+    "dnsLog": false,
+    "error": "",
+    "loglevel": "warning",
+    "maskAddress": ""
+  },
+  "api": {
+    "tag": "api",
+    "services": ["HandlerService", "LoggerService", "StatsService"]
+  },
+  "inbounds": [
+    {
+      "tag": "api",
+      "listen": "127.0.0.1",
+      "port": 62789,
+      "protocol": "tunnel",
+      "settings": { "address": "127.0.0.1" }
+    },
+    {
+      "tag": "inbound-443",
+      "listen": "",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "PLACEHOLDER_UUID",
+            "email": "user",
+            "flow": "",
+            "enable": true,
+            "limitIp": 0,
+            "totalGB": 0,
+            "expiryTime": 0,
+            "reset": 0,
+            "subId": "",
+            "comment": ""
+          }
+        ],
+        "decryption": "none",
+        "encryption": "none",
+        "fallbacks": []
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "xver": 0,
+          "target": "www.microsoft.com:443",
+          "serverNames": ["www.microsoft.com"],
+          "privateKey": "PLACEHOLDER_PRIVATE_KEY",
+          "minClientVer": "",
+          "maxClientVer": "",
+          "maxTimediff": 0,
+          "shortIds": ["PLACEHOLDER_SHORT_ID"],
+          "settings": {
+            "publicKey": "PLACEHOLDER_PUBLIC_KEY",
+            "fingerprint": "chrome",
+            "serverName": "",
+            "spiderX": "/"
+          }
+        },
+        "xhttpSettings": {
+          "path": "/",
+          "host": "",
+          "headers": {},
+          "noSSEHeader": false,
+          "xPaddingBytes": "100-1000",
+          "mode": "auto"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic", "fakedns"],
+        "metadataOnly": false,
+        "routeOnly": false
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "warp",
+      "protocol": "freedom",
+      "settings": { "domainStrategy": "UseIPv4" },
+      "sendThrough": "172.16.0.2"
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": { "domainStrategy": "AsIs" }
+    },
+    {
+      "tag": "blocked",
+      "protocol": "blackhole",
+      "settings": {}
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "ip": ["1.1.1.1", "8.8.8.8"],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "ip": ["geoip:ru"],
+        "outboundTag": "blocked"
+      },
+      {
+        "type": "field",
+        "inboundTag": ["api"],
+        "outboundTag": "api"
+      },
+      {
+        "type": "field",
+        "ip": ["geoip:private"],
+        "outboundTag": "blocked"
+      },
+      {
+        "type": "field",
+        "outboundTag": "blocked",
+        "protocol": ["bittorrent"]
+      },
+      {
+        "type": "field",
+        "inboundTag": ["dns_inbound"],
+        "outboundTag": "warp"
+      }
+    ]
+  },
+  "dns": {
+    "servers": [
+      {
+        "address": "1.1.1.1",
+        "port": 53,
+        "queryStrategy": "UseIP",
+        "skipFallback": true
+      },
+      {
+        "address": "8.8.8.8",
+        "port": 53,
+        "queryStrategy": "UseIP",
+        "skipFallback": true
+      }
+    ],
+    "queryStrategy": "UseIP",
+    "tag": "dns_inbound"
+  },
+  "policy": {
+    "levels": { "0": { "statsUserDownlink": true, "statsUserUplink": true } },
+    "system": {
+      "statsInboundDownlink": true,
+      "statsInboundUplink": true,
+      "statsOutboundDownlink": false,
+      "statsOutboundUplink": false
+    }
+  },
+  "stats": {}
+}

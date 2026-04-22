@@ -9,6 +9,8 @@ warning() { echo -e "${YELLOW}[!]${NC} $1"; }
 error()   { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 step()    { echo -e "\n${CYAN}━━ $1 ━━${NC}"; }
 
+REPO_RAW="https://raw.githubusercontent.com/maxzspb/vless/main"
+
 echo ""
 echo "══════════════════════════════════════════"
 echo "   VPN Setup: VLESS + Hysteria2 + WARP"
@@ -23,14 +25,12 @@ echo "  3) Только Hysteria2"
 echo ""
 read -p "Выбор [1/2/3]: " INSTALL_MODE
 INSTALL_MODE=${INSTALL_MODE:-1}
-
 case "$INSTALL_MODE" in
     1) INSTALL_VLESS=true;  INSTALL_HY=true  ;;
     2) INSTALL_VLESS=true;  INSTALL_HY=false ;;
     3) INSTALL_VLESS=false; INSTALL_HY=true  ;;
     *) error "Неверный выбор. Введи 1, 2 или 3." ;;
 esac
-
 echo ""
 
 # ── Параметры ────────────────────────────────────────────────
@@ -40,13 +40,12 @@ fi
 read -p "Домен для TLS-сертификата [Enter = самоподписанный]: " DOMAIN
 
 WORKDIR=~/vless
-XUI_PORT=2053  # дефолтный порт 3x-ui, меняется в Panel Settings при первом входе
+XUI_PORT=2053
 
-# ── Директории ───────────────────────────────────────────────
 mkdir -p $WORKDIR/{cert,db}
 
 # ── .env ─────────────────────────────────────────────────────
-step "Сохраняем конфиг"
+step "Конфиг"
 cat > $WORKDIR/.env << EOF
 HYSTERIA_PASSWORD=${HY_PASS:-}
 DOMAIN=${DOMAIN:-}
@@ -63,9 +62,7 @@ if [ -f $WORKDIR/cert/cert.crt ] && [ -f $WORKDIR/cert/private.key ]; then
     info "Сертификат уже существует — пропускаем"
 elif [ -n "$DOMAIN" ]; then
     info "Выпускаем сертификат для $DOMAIN..."
-    if ss -tlnp | grep -q ':80 '; then
-        error "Порт 80 занят. Освободи его и запусти скрипт снова."
-    fi
+    ss -tlnp | grep -q ':80 ' && error "Порт 80 занят — освободи и перезапусти скрипт"
     curl -s https://get.acme.sh | sh -s email=admin@$DOMAIN
     source ~/.bashrc
     ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
@@ -142,12 +139,16 @@ https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | \
         WARP_ADDR_USE="172.16.0.2/32"
     fi
 
+    # Table=off + policy routing через PostUp/PostDown
+    # sendThrough: 172.16.0.2 в Xray будет работать благодаря таблице 2408
     cat > /etc/wireguard/warp.conf << EOF
 [Interface]
 PrivateKey = $WARP_KEY_USE
 Address = $WARP_ADDR_USE
 MTU = 1420
 Table = off
+PostUp = ip route add default dev warp table 2408; ip rule add from 172.16.0.2 lookup 2408 2>/dev/null || true
+PostDown = ip route del default dev warp table 2408 2>/dev/null || true; ip rule del from 172.16.0.2 lookup 2408 2>/dev/null || true
 
 [Peer]
 PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
@@ -166,7 +167,7 @@ fi
 
 # ── Hysteria2 конфиг ─────────────────────────────────────────
 if $INSTALL_HY; then
-    step "Hysteria2 конфиг"
+    step "Hysteria2"
     cat > $WORKDIR/hysteria.yaml << EOF
 listen: :8443
 
@@ -250,19 +251,78 @@ $INSTALL_HY    && ! docker ps | grep -q "hysteria2" && { warning "hysteria2 не
 $FAILED && error "Проверь логи: docker compose logs"
 info "Контейнеры запущены"
 
-# ── Закрыть порт панели, оставить только localhost ───────────
+# ── Xray конфиг — генерируем и применяем автоматически ───────
 if $INSTALL_VLESS; then
-    step "Безопасность панели"
-    # Удаляем старое правило если есть (идемпотентность)
-    iptables -D INPUT -p tcp --dport $XUI_PORT ! -s 127.0.0.1 -j DROP 2>/dev/null || true
-    iptables -I INPUT -p tcp --dport $XUI_PORT ! -s 127.0.0.1 -j DROP
-    info "Порт $XUI_PORT закрыт снаружи (только SSH-туннель)"
+    step "Xray конфиг"
+
+    # Ждём пока 3x-ui инициализирует БД
+    for i in $(seq 1 20); do
+        [ -f $WORKDIR/db/x-ui.db ] && break
+        sleep 2
+    done
+
+    # Генерируем UUID и Reality keypair
+    UUID=$(cat /proc/sys/kernel/random/uuid)
+    SHORT_ID=$(openssl rand -hex 4)
+
+    # Пробуем получить keypair через xray внутри контейнера
+    KEYPAIR=$(docker exec 3x-ui xray x25519 2>/dev/null || \
+              docker exec 3x-ui /usr/local/x-ui/bin/xray x25519 2>/dev/null || echo "")
+    PRIVATE_KEY=$(echo "$KEYPAIR" | grep -i "private" | awk '{print $NF}')
+    PUBLIC_KEY=$(echo "$KEYPAIR"  | grep -i "public"  | awk '{print $NF}')
+
+    # Fallback — генерируем через openssl
+    if [ -z "$PRIVATE_KEY" ]; then
+        PRIVATE_KEY=$(openssl genpkey -algorithm X25519 2>/dev/null | \
+            openssl pkey -outform DER 2>/dev/null | tail -c 32 | \
+            base64 | tr '+/' '-_' | tr -d '=' || echo "GENERATE_IN_PANEL")
+        PUBLIC_KEY="CHECK_PANEL"
+        warning "Reality keypair: открой панель и нажми Get New Cert в inbound"
+    fi
+
+    info "UUID: $UUID"
+    info "Reality PrivateKey готов"
+
+    # Скачиваем шаблон
+    XRAY_TPL=$WORKDIR/xray_config_template.json
+    [ ! -f "$XRAY_TPL" ] && \
+        curl -fsSL "$REPO_RAW/xray_config_template.json" -o "$XRAY_TPL" 2>/dev/null || true
+
+    if [ -f "$XRAY_TPL" ]; then
+        sed \
+            -e "s/PLACEHOLDER_UUID/$UUID/g" \
+            -e "s/PLACEHOLDER_PRIVATE_KEY/$PRIVATE_KEY/g" \
+            -e "s/PLACEHOLDER_PUBLIC_KEY/$PUBLIC_KEY/g" \
+            -e "s/PLACEHOLDER_SHORT_ID/$SHORT_ID/g" \
+            "$XRAY_TPL" > $WORKDIR/xray_config.json
+
+        docker cp $WORKDIR/xray_config.json 3x-ui:/app/bin/config.json
+        docker restart 3x-ui
+        sleep 4
+        info "Xray конфиг применён"
+
+        VPS_IP=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null)
+        VLESS_URI="vless://${UUID}@${VPS_IP}:443?type=xhttp&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=www.microsoft.com&sid=${SHORT_ID}&spx=%2F&path=%2F&mode=auto#VLESS-$(hostname)"
+        echo "$VLESS_URI" > $WORKDIR/vless-uri.txt
+        info "VLESS URI сохранён: $WORKDIR/vless-uri.txt"
+    else
+        warning "Шаблон не найден — настрой VLESS в панели вручную (Шаг 4 в README)"
+    fi
 fi
 
-# ── iptables: port hopping для Hysteria2 ────────────────────
+# ── Безопасность: закрыть порт панели снаружи ────────────────
+if $INSTALL_VLESS; then
+    step "Безопасность панели"
+    iptables -D INPUT -p tcp --dport $XUI_PORT ! -s 127.0.0.1 -j DROP 2>/dev/null || true
+    iptables -I INPUT -p tcp --dport $XUI_PORT ! -s 127.0.0.1 -j DROP
+    info "Порт $XUI_PORT закрыт снаружи — только SSH-туннель"
+fi
+
+# ── iptables: UDP port hopping для Hysteria2 ─────────────────
 if $INSTALL_HY; then
     step "iptables / port hopping"
-    iptables -t nat -D PREROUTING -p udp --dport 443       -j REDIRECT --to-port 8443 2>/dev/null || true
+    # Идемпотентно: удаляем старые перед добавлением
+    iptables -t nat -D PREROUTING -p udp --dport 443         -j REDIRECT --to-port 8443 2>/dev/null || true
     iptables -t nat -D PREROUTING -p udp --dport 20000:31462 -j REDIRECT --to-port 8443 2>/dev/null || true
     iptables -t nat -D PREROUTING -p udp --dport 31464:50000 -j REDIRECT --to-port 8443 2>/dev/null || true
     iptables -t nat -A PREROUTING -p udp --dport 443         -j REDIRECT --to-port 8443
@@ -275,11 +335,11 @@ fi
 # ── DNS ──────────────────────────────────────────────────────
 step "DNS"
 resolvectl dns ens3 1.1.1.1 8.8.8.8 2>/dev/null || \
-resolvectl dns eth0  1.1.1.1 8.8.8.8 2>/dev/null || \
+resolvectl dns eth0 1.1.1.1 8.8.8.8 2>/dev/null || \
 echo "nameserver 1.1.1.1" > /etc/resolv.conf
 info "DNS: 1.1.1.1, 8.8.8.8"
 
-# ── Cron (идемпотентный) ─────────────────────────────────────
+# ── Cron: автообновление GeoIP и сертификата ─────────────────
 step "Автообновление"
 crontab -l 2>/dev/null | grep -v "geosite\|geoip\|acme-renew" | crontab - 2>/dev/null || true
 if $INSTALL_VLESS; then
@@ -289,12 +349,13 @@ fi
 if $INSTALL_HY; then
     (crontab -l 2>/dev/null; echo "10 3 * * 0 wget -q -O $WORKDIR/geoip.mmdb https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb && docker restart hysteria2") | crontab -
 fi
-[ -n "$DOMAIN" ] && (crontab -l 2>/dev/null; echo "0 4 * * 1 ~/.acme.sh/acme.sh --cron --home ~/.acme.sh >> /var/log/acme-renew.log 2>&1") | crontab -
-info "Cron настроен (GeoIP каждое воскресенье 3:00)"
+[ -n "$DOMAIN" ] && \
+    (crontab -l 2>/dev/null; echo "0 4 * * 1 ~/.acme.sh/acme.sh --cron --home ~/.acme.sh >> /var/log/acme-renew.log 2>&1") | crontab -
+info "Cron настроен (GeoIP каждое воскресенье в 3:00)"
 
 # ── Итог ─────────────────────────────────────────────────────
 MY_IP=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null)
-SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/:22 |:2[0-9]{3} /{print $4}' | grep sshd | cut -d: -f2 | head -1 || echo "22")
+SSH_PORT=$(ss -tlnp 2>/dev/null | grep sshd | awk '{print $4}' | cut -d: -f2 | head -1 || echo "22")
 
 echo ""
 echo "══════════════════════════════════════════════════════════"
@@ -304,17 +365,26 @@ echo ""
 
 if $INSTALL_VLESS; then
     echo -e "  ${CYAN}┌─ ПАНЕЛЬ 3x-ui ──────────────────────────────────────${NC}"
-    echo    "  │  Доступна только через SSH-туннель:"
+    echo    "  │  Открой через SSH-туннель на своей машине:"
     echo    "  │"
     echo    "  │  ssh -L $XUI_PORT:127.0.0.1:$XUI_PORT root@$MY_IP -p ${SSH_PORT:-22}"
     echo    "  │"
-    echo    "  │  Затем открой: http://127.0.0.1:$XUI_PORT"
-    echo    "  │  Логин: admin   Пароль: admin"
-    echo    "  │  Сразу смени: Panel Settings → User"
-    echo    "  │"
-    echo    "  │  Далее настрой VLESS inbound — см. README.md Шаг 4"
+    echo    "  │  Затем: http://127.0.0.1:$XUI_PORT"
+    echo    "  │  Логин: admin / Пароль: admin — сразу смени!"
     echo -e "  ${CYAN}└─────────────────────────────────────────────────────${NC}"
     echo ""
+
+    if [ -f $WORKDIR/vless-uri.txt ]; then
+        VLESS_URI=$(cat $WORKDIR/vless-uri.txt)
+        echo -e "  ${CYAN}┌─ VLESS — готовая ссылка ────────────────────────────${NC}"
+        echo    "  │"
+        echo    "  │  $VLESS_URI"
+        echo    "  │"
+        echo    "  │  Hiddify: + → Добавить по ссылке"
+        echo    "  │  Файл: $WORKDIR/vless-uri.txt"
+        echo -e "  ${CYAN}└─────────────────────────────────────────────────────${NC}"
+        echo ""
+    fi
 fi
 
 if $INSTALL_HY; then
@@ -324,11 +394,11 @@ if $INSTALL_HY; then
     echo    "  │"
     echo    "  │  $HY_URI"
     echo    "  │"
-    echo    "  │  Импортируй в Hiddify: + → Добавить по ссылке"
-    echo    "  │  URI сохранён: $WORKDIR/hysteria2-uri.txt"
+    echo    "  │  Hiddify: + → Добавить по ссылке"
+    echo    "  │  Файл: $WORKDIR/hysteria2-uri.txt"
     echo -e "  ${CYAN}└─────────────────────────────────────────────────────${NC}"
     echo ""
 fi
 
-echo "  Выходной IP: ${WARP_IP:-не определён} (Cloudflare WARP)"
+echo "  Выходной IP WARP: ${WARP_IP:-не определён} (Cloudflare)"
 echo ""
