@@ -17,7 +17,29 @@ echo "   VPN Setup: VLESS + Hysteria2 + WARP"
 echo "══════════════════════════════════════════"
 echo ""
 
+# ── Проверка Docker ──────────────────────────────────────────
+step "Проверка зависимостей"
+apt update -qq && apt install -y curl wget wireguard-tools iptables resolvconf jq lsb-release coreutils openssl -qq
+
+if ! command -v docker &> /dev/null; then
+    info "Устанавливаем Docker..."
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable --now docker
+fi
+
+if docker compose version &> /dev/null; then
+    DOCKER_COMPOSE="docker compose"
+elif command -v docker-compose &> /dev/null; then
+    DOCKER_COMPOSE="docker-compose"
+else
+    info "Устанавливаем Docker Compose Plugin..."
+    apt-get install -y docker-compose-plugin -qq
+    DOCKER_COMPOSE="docker compose"
+fi
+info "Используем команду: $DOCKER_COMPOSE"
+
 # ── Выбор компонентов ────────────────────────────────────────
+echo ""
 echo "Что установить?"
 echo "  1) VLESS + Hysteria2  (рекомендуется)"
 echo "  2) Только VLESS"
@@ -82,21 +104,23 @@ fi
 
 # ── GeoIP базы ───────────────────────────────────────────────
 step "GeoIP базы"
+WGET_OPTS="-q --connect-timeout=10 --tries=3"
+
 if $INSTALL_VLESS; then
     [ ! -f $WORKDIR/geosite.dat ] && \
-        wget -q -O $WORKDIR/geosite.dat \
+        wget $WGET_OPTS -O $WORKDIR/geosite.dat \
         https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat && \
-        info "geosite.dat загружен" || info "geosite.dat уже есть"
+        info "geosite.dat загружен" || info "geosite.dat уже есть (или недоступен)"
     [ ! -f $WORKDIR/geoip.dat ] && \
-        wget -q -O $WORKDIR/geoip.dat \
+        wget $WGET_OPTS -O $WORKDIR/geoip.dat \
         https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat && \
-        info "geoip.dat загружен" || info "geoip.dat уже есть"
+        info "geoip.dat загружен" || info "geoip.dat уже есть (или недоступен)"
 fi
 if $INSTALL_HY; then
     [ ! -f $WORKDIR/geoip.mmdb ] && \
-        wget -q -O $WORKDIR/geoip.mmdb \
+        wget $WGET_OPTS -O $WORKDIR/geoip.mmdb \
         https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb && \
-        info "geoip.mmdb загружен" || info "geoip.mmdb уже есть"
+        info "geoip.mmdb загружен" || info "geoip.mmdb уже есть (или недоступен)"
 fi
 
 # ── Cloudflare WARP ──────────────────────────────────────────
@@ -242,13 +266,13 @@ info "docker-compose.yaml создан"
 # ── Запуск контейнеров ───────────────────────────────────────
 step "Docker"
 cd $WORKDIR
-docker-compose up -d --no-recreate
+$DOCKER_COMPOSE up -d --no-recreate
 sleep 8
 
 FAILED=false
 $INSTALL_VLESS && ! docker ps | grep -q "3x-ui"    && { warning "3x-ui не запустился"; FAILED=true; }
 $INSTALL_HY    && ! docker ps | grep -q "hysteria2" && { warning "hysteria2 не запустился"; FAILED=true; }
-$FAILED && error "Проверь логи: docker compose logs"
+$FAILED && error "Проверь логи: $DOCKER_COMPOSE logs"
 info "Контейнеры запущены"
 
 # ── Xray конфиг — генерируем и применяем автоматически ───────
@@ -328,7 +352,7 @@ if $INSTALL_HY; then
     iptables -t nat -A PREROUTING -p udp --dport 443         -j REDIRECT --to-port 8443
     iptables -t nat -A PREROUTING -p udp --dport 20000:31462 -j REDIRECT --to-port 8443
     iptables -t nat -A PREROUTING -p udp --dport 31464:50000 -j REDIRECT --to-port 8443
-    netfilter-persistent save
+    netfilter-persistent save 2>/dev/null || true
     info "UDP 443 + 20000-50000 → 8443"
 fi
 
