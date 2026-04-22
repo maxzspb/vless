@@ -61,7 +61,7 @@
 
 ```bash
 ssh root@<IP_VPS>
-
+sudo -i
 apt update && apt install -y curl wget git wireguard \
     netfilter-persistent iptables-persistent docker.io
 
