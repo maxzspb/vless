@@ -633,11 +633,11 @@ ssh -L 2053:127.0.0.1:2053 root@<IP_VPS> -p <SSH_PORT>
   
 
 > ⚠️ Кнопку **WARP** не нажимай — Cloudflare API недоступен со многих VPS. Добавь outbound вручную через JSON-редактор с 
-> `{
-  "tag": "warp",
-  "protocol": "freedom",
-  "settings": { "domainStrategy": "UseIPv4" },
-  "sendThrough": "172.16.0.2"
+> `{  
+  "tag": "warp",  
+  "protocol": "freedom",  
+  "settings": { "domainStrategy": "UseIPv4" },  
+  "sendThrough": "172.16.0.2"  
 }`.
 
   
