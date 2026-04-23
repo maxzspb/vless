@@ -1,8 +1,8 @@
 #!/bin/bash
 # VPN Setup: VLESS (3x-ui/Xray) + Hysteria2 + Cloudflare WARP
+# https://github.com/maxzspb/vless
 set -e
 
-REPO_RAW="https://raw.githubusercontent.com/maxzspb/vless/main"
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
 info()    { echo -e "${GREEN}[✓]${NC} $1"; }
 warning() { echo -e "${YELLOW}[!]${NC} $1"; }
@@ -11,8 +11,8 @@ step()    { echo -e "\n${CYAN}━━ $1 ━━${NC}"; }
 
 # ── Зависимости и Docker ─────────────────────────────────────
 apt-get update -qq && apt-get install -y -qq \
-    curl wget wireguard-tools iptables netfilter-persistent \
-    iptables-persistent lsb-release openssl sqlite3 >/dev/null 2>&1
+    curl wget wireguard-tools netfilter-persistent \
+    iptables-persistent lsb-release openssl sqlite3 python3 >/dev/null 2>&1
 
 if ! command -v docker &>/dev/null; then
     curl -fsSL https://get.docker.com | sh
@@ -101,7 +101,7 @@ step "GeoIP базы"
 download_geo() {
     local url=$1 out=$2
     if [ -s "$out" ]; then info "$(basename $out) уже есть"; return; fi
-    wget -q --connect-timeout=10 --tries=2 -O "$out.tmp" "$url" && \
+    wget -q --connect-timeout=15 --tries=3 -O "$out.tmp" "$url" && \
         mv "$out.tmp" "$out" && info "$(basename $out) загружен" || \
         { warning "Не удалось скачать $(basename $out)"; rm -f "$out.tmp"; }
 }
@@ -141,9 +141,9 @@ https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | \
 
     info "Регистрируем WARP аккаунт..."
     systemctl restart warp-svc 2>/dev/null || true
-    sleep 4
+    sleep 5
     warp-cli --accept-tos registration new 2>/dev/null || true
-    sleep 6
+    sleep 7
 
     WARP_PRIVATE=$(warp-cli --accept-tos registration show 2>/dev/null | grep -i "private" | awk '{print $NF}' || true)
     WARP_ADDRESS=$(warp-cli --accept-tos registration show 2>/dev/null | grep -i "IPv4\|address" | head -1 | awk '{print $NF}' || true)
@@ -158,8 +158,8 @@ https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | \
         WARP_ADDR_USE="172.16.0.2/32"
     fi
 
-    # Table=off + policy routing — Xray использует sendThrough:172.16.0.2
-    # ядро Linux видит src 172.16.0.2 → таблица 2408 → dev warp
+    # Table=off + PostUp создаёт таблицу 2408
+    # Xray использует sendThrough: 172.16.0.2 → ядро видит src 172.16.0.2 → таблица 2408 → dev warp
     cat > /etc/wireguard/warp.conf << EOF
 [Interface]
 PrivateKey = $WARP_KEY_USE
@@ -264,111 +264,146 @@ $INSTALL_HY    && ! docker ps | grep -q "hysteria2" && { warning "hysteria2 не
 $FAILED && error "Проверь логи: $DC logs"
 info "Контейнеры запущены"
 
-# ── Настройка 3x-ui через API + SQLite ───────────────────────
+# ── Настройка VLESS через SQLite (единственный надёжный способ) ──
 if $INSTALL_VLESS; then
     step "Настройка VLESS"
 
-    # Генерируем ключи через xray внутри контейнера
-    KEYPAIR=""
-    for i in $(seq 1 15); do
-        KEYPAIR=$(docker exec 3x-ui /usr/local/x-ui/bin/xray x25519 2>/dev/null || \
-                  docker exec 3x-ui xray x25519 2>/dev/null || echo "")
-        [ -n "$(echo $KEYPAIR | grep -i private)" ] && break
-        sleep 2
-    done
-    PRIVATE_KEY=$(echo "$KEYPAIR" | grep -i "private" | awk '{print $NF}')
-    PUBLIC_KEY=$(echo  "$KEYPAIR" | grep -i "public"  | awk '{print $NF}')
+    # Генерируем X25519 ключи через openssl
+    # (xray бинарник в этом образе: /app/bin/xray-linux-amd64, x25519 не всегда работает)
+    PRIVATE_RAW=$(openssl genpkey -algorithm X25519 2>/dev/null)
+    PRIVATE_KEY=$(echo "$PRIVATE_RAW" | openssl pkey -outform DER 2>/dev/null | \
+        tail -c 32 | base64 | tr '+/' '-_' | tr -d '=\n')
+    PUBLIC_KEY=$(echo "$PRIVATE_RAW" | openssl pkey -pubout -outform DER 2>/dev/null | \
+        tail -c 32 | base64 | tr '+/' '-_' | tr -d '=\n')
     UUID=$(cat /proc/sys/kernel/random/uuid)
     SHORT_ID=$(openssl rand -hex 4)
 
-    if [ -z "$PRIVATE_KEY" ]; then
-        warning "xray не сгенерировал ключи — нажми Get New Cert в панели"
-        PRIVATE_KEY="CHANGE_IN_PANEL"
-        PUBLIC_KEY="CHANGE_IN_PANEL"
-    else
-        info "Reality keypair готов"
-    fi
-    info "UUID: $UUID  ShortID: $SHORT_ID"
+    info "UUID: $UUID"
+    info "Reality keypair сгенерирован"
 
     # Ждём инициализации БД 3x-ui
-    for i in $(seq 1 20); do
+    for i in $(seq 1 25); do
         [ -f $WORKDIR/db/x-ui.db ] && \
             sqlite3 $WORKDIR/db/x-ui.db "SELECT 1 FROM users LIMIT 1;" &>/dev/null && break
         sleep 2
     done
 
-    # Настраиваем через API (3x-ui должен уже быть готов)
-    XUI_URL="http://127.0.0.1:$XUI_PORT"
-    COOKIE_JAR=$(mktemp)
+    # Останавливаем 3x-ui для безопасной записи в БД
+    docker stop 3x-ui >/dev/null 2>&1 || true
+    sleep 2
 
-    # Логин
-    LOGIN_OK=$(curl -s -c "$COOKIE_JAR" -X POST "$XUI_URL/login" \
-        -F "username=admin" -F "password=admin" | \
-        python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('success','false'))" 2>/dev/null || echo "false")
+    python3 << PYEOF
+import sqlite3, json
 
-    if [ "$LOGIN_OK" = "True" ] || [ "$LOGIN_OK" = "true" ]; then
-        info "Авторизация в 3x-ui OK"
+DB = '$WORKDIR/db/x-ui.db'
+UUID = '$UUID'
+PRIVATE_KEY = '$PRIVATE_KEY'
+PUBLIC_KEY = '$PUBLIC_KEY'
+SHORT_ID = '$SHORT_ID'
 
-        # Строим JSON для inbound (settings/streamSettings — строки, а не объекты!)
-        SETTINGS_JSON="{\"clients\":[{\"id\":\"$UUID\",\"email\":\"user\",\"flow\":\"\",\"enable\":true,\"limitIp\":0,\"totalGB\":0,\"expiryTime\":0,\"reset\":0,\"subId\":\"\",\"comment\":\"\"}],\"decryption\":\"none\",\"encryption\":\"none\",\"fallbacks\":[]}"
-        STREAM_JSON="{\"network\":\"xhttp\",\"security\":\"reality\",\"realitySettings\":{\"show\":false,\"xver\":0,\"target\":\"www.microsoft.com:443\",\"serverNames\":[\"www.microsoft.com\"],\"privateKey\":\"$PRIVATE_KEY\",\"minClientVer\":\"\",\"maxClientVer\":\"\",\"maxTimediff\":0,\"shortIds\":[\"$SHORT_ID\"],\"settings\":{\"publicKey\":\"$PUBLIC_KEY\",\"fingerprint\":\"chrome\",\"serverName\":\"\",\"spiderX\":\"/\"}},\"xhttpSettings\":{\"path\":\"/\",\"host\":\"\",\"headers\":{},\"noSSEHeader\":false,\"xPaddingBytes\":\"100-1000\",\"mode\":\"auto\"}}"
-        SNIFF_JSON="{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":false,\"routeOnly\":false}"
+db = sqlite3.connect(DB)
+cur = db.cursor()
 
-        # Добавляем inbound через API
-        ADD_RESULT=$(curl -s -b "$COOKIE_JAR" -X POST "$XUI_URL/xui/API/inbounds/add" \
-            -H "Content-Type: application/json" \
-            -d "{\"remark\":\"VLESS-2026\",\"enable\":true,\"listen\":\"\",\"port\":443,\"protocol\":\"vless\",\"settings\":$(echo $SETTINGS_JSON | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))'),\"streamSettings\":$(echo $STREAM_JSON | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))'),\"sniffing\":$(echo $SNIFF_JSON | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))'),\"expiryTime\":0}" \
-            2>/dev/null || echo "{}")
+# --- inbound ---
+settings = json.dumps({
+    "clients": [{"id": UUID, "email": "user", "flow": "", "enable": True,
+                 "limitIp": 0, "totalGB": 0, "expiryTime": 0,
+                 "reset": 0, "subId": "", "comment": ""}],
+    "decryption": "none", "encryption": "none", "fallbacks": []
+})
+stream = json.dumps({
+    "network": "xhttp", "security": "reality",
+    "realitySettings": {
+        "show": False, "xver": 0,
+        "target": "www.microsoft.com:443",
+        "serverNames": ["www.microsoft.com"],
+        "privateKey": PRIVATE_KEY,
+        "minClientVer": "", "maxClientVer": "", "maxTimediff": 0,
+        "shortIds": [SHORT_ID],
+        "settings": {"publicKey": PUBLIC_KEY, "fingerprint": "chrome",
+                     "serverName": "", "spiderX": "/"}
+    },
+    "xhttpSettings": {"path": "/", "host": "", "headers": {},
+                      "noSSEHeader": False, "xPaddingBytes": "100-1000", "mode": "auto"}
+})
+sniffing = json.dumps({
+    "enabled": True,
+    "destOverride": ["http", "tls", "quic", "fakedns"],
+    "metadataOnly": False, "routeOnly": False
+})
 
-        ADD_OK=$(echo "$ADD_RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('success','false'))" 2>/dev/null || echo "false")
+cur.execute("DELETE FROM inbounds WHERE tag='inbound-443'")
+cur.execute("""
+    INSERT INTO inbounds
+        (user_id, up, down, total, remark, enable, expiry_time,
+         listen, port, protocol, settings, stream_settings, tag, sniffing,
+         traffic_reset, last_traffic_reset_time)
+    VALUES (1,0,0,0,'VLESS-2026',1,0,'',443,'vless',?,?,'inbound-443',?,'never',0)
+""", (settings, stream, sniffing))
 
-        if [ "$ADD_OK" = "True" ] || [ "$ADD_OK" = "true" ]; then
-            info "Inbound VLESS добавлен через API"
-        else
-            warning "API inbound не добавился ($(echo $ADD_RESULT | head -c 100)) — добавь вручную в панели"
-        fi
+# --- outbounds / routing / dns ---
+# Ключи xrayOutboundConfig, xrayRoutingConfig, xrayDNSConfig — 3x-ui читает их при генерации конфига
+# xrayTemplateConfig НЕ ТРОГАЕМ — если он есть, создаёт дубль inbound
+outbounds = json.dumps([
+    {"tag": "warp", "protocol": "freedom",
+     "settings": {"domainStrategy": "UseIPv4"}, "sendThrough": "172.16.0.2"},
+    {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "AsIs"}},
+    {"tag": "blocked", "protocol": "blackhole", "settings": {}}
+])
+routing = json.dumps({
+    "domainStrategy": "AsIs",
+    "rules": [
+        {"type": "field", "ip": ["1.1.1.1","8.8.8.8"], "outboundTag": "direct"},
+        {"type": "field", "ip": ["geoip:ru"], "outboundTag": "blocked"},
+        {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+        {"type": "field", "ip": ["geoip:private"], "outboundTag": "blocked"},
+        {"type": "field", "outboundTag": "blocked", "protocol": ["bittorrent"]},
+        {"type": "field", "inboundTag": ["dns_inbound"], "outboundTag": "warp"}
+    ]
+})
+dns = json.dumps({
+    "servers": [
+        {"address": "1.1.1.1", "port": 53, "queryStrategy": "UseIP", "skipFallback": True},
+        {"address": "8.8.8.8", "port": 53, "queryStrategy": "UseIP", "skipFallback": True}
+    ],
+    "queryStrategy": "UseIP",
+    "tag": "dns_inbound"
+})
 
-        # Настраиваем outbounds через SQLite (API для Xray Configs менее стабилен)
-        # Останавливаем 3x-ui чтобы безопасно писать в БД
-        docker stop 3x-ui > /dev/null 2>&1 || true
-        sleep 2
+for key, val in [("xrayOutboundConfig", outbounds),
+                 ("xrayRoutingConfig", routing),
+                 ("xrayDNSConfig", dns)]:
+    cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, val))
 
-        # Пишем outbounds/routing/dns в settings таблицу 3x-ui
-        OUTBOUNDS_JSON='[{"tag":"warp","protocol":"freedom","settings":{"domainStrategy":"UseIPv4"},"sendThrough":"172.16.0.2"},{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"AsIs"}},{"tag":"blocked","protocol":"blackhole","settings":{}}]'
-        ROUTING_JSON='{"domainStrategy":"AsIs","rules":[{"type":"field","ip":["1.1.1.1","8.8.8.8"],"outboundTag":"direct"},{"type":"field","ip":["geoip:ru"],"outboundTag":"blocked"},{"type":"field","inboundTag":["api"],"outboundTag":"api"},{"type":"field","ip":["geoip:private"],"outboundTag":"blocked"},{"type":"field","outboundTag":"blocked","protocol":["bittorrent"]},{"type":"field","inboundTag":["dns_inbound"],"outboundTag":"warp"}]}'
-        DNS_JSON='{"servers":[{"address":"1.1.1.1","port":53,"queryStrategy":"UseIP","skipFallback":true},{"address":"8.8.8.8","port":53,"queryStrategy":"UseIP","skipFallback":true}],"queryStrategy":"UseIP","tag":"dns_inbound"}'
+# Удаляем xrayTemplateConfig — он вызывает дублирование inbound
+cur.execute("DELETE FROM settings WHERE key='xrayTemplateConfig'")
 
-        sqlite3 $WORKDIR/db/x-ui.db "INSERT OR REPLACE INTO settings (key, value) VALUES ('xrayOutboundConfig', '$(echo $OUTBOUNDS_JSON | sed "s/'/''/g")');" 2>/dev/null || true
-        sqlite3 $WORKDIR/db/x-ui.db "INSERT OR REPLACE INTO settings (key, value) VALUES ('xrayRoutingConfig', '$(echo $ROUTING_JSON | sed "s/'/''/g")');" 2>/dev/null || true
-        sqlite3 $WORKDIR/db/x-ui.db "INSERT OR REPLACE INTO settings (key, value) VALUES ('xrayDNSConfig', '$(echo $DNS_JSON | sed "s/'/''/g")');" 2>/dev/null || true
+db.commit()
 
-        docker start 3x-ui > /dev/null 2>&1 || true
-        sleep 5
-        info "Outbounds/routing/DNS записаны в БД"
+cur.execute("SELECT id, remark, port, tag FROM inbounds")
+print("Inbound в БД:", cur.fetchall())
+cur.execute("SELECT key FROM settings WHERE key LIKE 'xray%'")
+print("Settings:", [r[0] for r in cur.fetchall()])
+db.close()
+print("SQLite OK")
+PYEOF
 
-    else
-        warning "Авторизация в 3x-ui не удалась — настрой outbounds/inbound вручную в панели"
-        warning "Ключи для inbound сохранены в $WORKDIR/vless-keys.txt"
-    fi
+    docker start 3x-ui >/dev/null 2>&1 || true
+    sleep 8
+    info "3x-ui запущен с конфигом из БД"
 
-    rm -f "$COOKIE_JAR"
-
-    # Сохраняем ключи для ручной настройки/проверки
+    # Сохраняем ключи и URI
     VPS_IP=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null || true)
+    VLESS_URI="vless://${UUID}@${VPS_IP}:443?type=xhttp&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=www.microsoft.com&sid=${SHORT_ID}&spx=%2F&path=%2F&mode=auto#VLESS-$(hostname)"
+    echo "$VLESS_URI" > $WORKDIR/vless-uri.txt
     cat > $WORKDIR/vless-keys.txt << EOF
 UUID:        $UUID
 PrivateKey:  $PRIVATE_KEY
 PublicKey:   $PUBLIC_KEY
 ShortID:     $SHORT_ID
-SNI/Target:  www.microsoft.com
-Port:        443
 VPS IP:      $VPS_IP
 EOF
     info "Ключи сохранены: $WORKDIR/vless-keys.txt"
-
-    # Собираем ссылку
-    VLESS_URI="vless://${UUID}@${VPS_IP}:443?type=xhttp&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=www.microsoft.com&sid=${SHORT_ID}&spx=%2F&path=%2F&mode=auto#VLESS-$(hostname)"
-    echo "$VLESS_URI" > $WORKDIR/vless-uri.txt
 fi
 
 # ── Порт панели закрыть снаружи ──────────────────────────────
@@ -427,16 +462,11 @@ if $INSTALL_VLESS; then
     echo -e "  ${CYAN}┌─ ПАНЕЛЬ 3x-ui ──────────────────────────────────────${NC}"
     echo    "  │  ssh -L $XUI_PORT:127.0.0.1:$XUI_PORT root@$MY_IP -p ${SSH_PORT:-22}"
     echo    "  │  http://127.0.0.1:$XUI_PORT   (admin / admin — смени!)"
-    echo    "  │"
-    echo    "  │  В панели проверь Outbounds — должен быть warp (freedom"
-    echo    "  │  + sendThrough 172.16.0.2), Routing Rules и DNS."
-    echo    "  │  Если нет — настрой по README.md раздел «Настройка VLESS»"
     echo -e "  ${CYAN}└─────────────────────────────────────────────────────${NC}"
     echo ""
     if [ -f $WORKDIR/vless-uri.txt ]; then
-        VLESS_LINK=$(cat $WORKDIR/vless-uri.txt)
-        echo -e "  ${CYAN}┌─ VLESS — ссылка подключения ────────────────────────${NC}"
-        echo    "  │  $VLESS_LINK"
+        echo -e "  ${CYAN}┌─ VLESS ─────────────────────────────────────────────${NC}"
+        echo    "  │  $(cat $WORKDIR/vless-uri.txt)"
         echo    "  │  Файл: $WORKDIR/vless-uri.txt"
         echo -e "  ${CYAN}└─────────────────────────────────────────────────────${NC}"
         echo ""
