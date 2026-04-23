@@ -460,7 +460,7 @@ echo ""
 
 if $INSTALL_VLESS; then
     echo -e "  ${CYAN}┌─ ПАНЕЛЬ 3x-ui ──────────────────────────────────────${NC}"
-    echo    "  │  ssh -L $XUI_PORT:127.0.0.1:$XUI_PORT root@$MY_IP -p ${SSH_PORT:-22}"
+    echo    "  │  ssh -L $XUI_PORT:127.0.0.1:$XUI_PORT ${SUDO_USER:-root}@$MY_IP -p ${SSH_PORT:-22}"
     echo    "  │  http://127.0.0.1:$XUI_PORT   (admin / admin — смени!)"
     echo -e "  ${CYAN}└─────────────────────────────────────────────────────${NC}"
     echo ""
@@ -485,3 +485,20 @@ fi
 
 echo "  WARP IP: ${WARP_IP:-не определён}"
 echo ""
+
+if $INSTALL_VLESS; then
+    echo -e "  ${YELLOW}┌─ ВАЖНО: добавь warp outbound в панели ─────────────${NC}"
+    echo    "  │  Xray Configs → Outbounds → Add Outbound → вставь JSON:"
+    echo    "  │"
+    echo    "  │  {"
+    echo    "  │    \"tag\": \"warp\","
+    echo    "  │    \"protocol\": \"freedom\","
+    echo    "  │    \"settings\": { \"domainStrategy\": \"UseIPv4\" },"
+    echo    "  │    \"sendThrough\": \"172.16.0.2\""
+    echo    "  │  }"
+    echo    "  │"
+    echo    "  │  Затем добавь direct (freedom) и blocked (blackhole)."
+    echo    "  │  Save → Restart Xray"
+    echo -e "  ${YELLOW}└─────────────────────────────────────────────────────${NC}"
+    echo ""
+fi
