@@ -109,6 +109,23 @@ openssl req -x509 -nodes -newkey rsa:2048 \
     -days 3650 -subj "/CN=bing.com"
 ```
 
+### 3. настройка сетевых правил iptables и DNS
+
+```bash
+iptables -I INPUT -p tcp --dport 2053 ! -s 127.0.0.1 -j DROP
+netfilter-persistent save
+
+resolvectl dns ens3 1.1.1.1 8.8.8.8 2>/dev/null || \
+resolvectl dns eth0 1.1.1.1 8.8.8.8 2>/dev/null || \
+echo "nameserver 1.1.1.1" > /etc/resolv.conf
+```
+опционально для Hysteria2
+
+```bash
+iptables -t nat -A PREROUTING -p udp --dport 443         -j REDIRECT --to-port 8443
+iptables -t nat -A PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-port 8443
+```
+
 ## Ручная установка Hysteria2
 
 ### 1. Cloudflare WARP
@@ -161,20 +178,7 @@ wget -O geoip.mmdb \
     https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb
 ```
 
-### 3. настройка сетевых правил iptables и DNS
-
-```bash
-iptables -t nat -A PREROUTING -p udp --dport 443         -j REDIRECT --to-port 8443
-iptables -t nat -A PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-port 8443
-iptables -I INPUT -p tcp --dport 2053 ! -s 127.0.0.1 -j DROP
-netfilter-persistent save
-
-resolvectl dns ens3 1.1.1.1 8.8.8.8 2>/dev/null || \
-resolvectl dns eth0 1.1.1.1 8.8.8.8 2>/dev/null || \
-echo "nameserver 1.1.1.1" > /etc/resolv.conf
-```
-
-### 4. Hysteria2 конфиг
+### 3. Hysteria2 конфиг
 
 `~/vless/hysteria.yaml`:
 
@@ -207,7 +211,7 @@ acl:
     - reject(geoip:ru)
     - warp(all)
 ```
-### 5. Hysteria2 контейнер
+### 4. Hysteria2 контейнер
 
 `~/vless/docker-compose.hysteria.yaml`:
 
