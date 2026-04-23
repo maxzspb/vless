@@ -124,6 +124,7 @@ echo "nameserver 1.1.1.1" > /etc/resolv.conf
 ```bash
 iptables -t nat -A PREROUTING -p udp --dport 443         -j REDIRECT --to-port 8443
 iptables -t nat -A PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-port 8443
+netfilter-persistent save
 ```
 
 ## Ручная установка Hysteria2
